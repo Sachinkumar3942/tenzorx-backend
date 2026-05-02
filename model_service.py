@@ -1,5 +1,7 @@
 import io
 from PIL import Image
+import PIL.ExifTags
+import math
 import numpy as np
 from ultralytics import YOLO
 import requests
@@ -12,7 +14,6 @@ import json
 # ==========================================
 yolo_model = YOLO("yolov10x.pt")
 
-# Initialize baseline training data
 train_data = pd.DataFrame({
     'sku_count': [450, 120, 800, 50, 300, 600, 150, 900],
     'shelf_density': [0.85, 0.40, 0.95, 0.20, 0.70, 0.88, 0.50, 0.98],
@@ -21,7 +22,6 @@ train_data = pd.DataFrame({
     'sku_diversity': [7, 2, 9, 1, 4, 6, 2, 10],
     'shop_size_sqft': [200, 100, 400, 80, 150, 250, 120, 500]
 })
-# Daily sales estimates (INR) mapped to store profiles
 y_sales = np.array([18500, 7500, 28000, 4500, 12000, 22000, 8000, 35000])
 
 model_lower = lgb.LGBMRegressor(objective='quantile', alpha=0.1, verbose=-1, min_child_samples=1)
@@ -31,126 +31,152 @@ model_upper = lgb.LGBMRegressor(objective='quantile', alpha=0.9, verbose=-1, min
 model_upper.fit(train_data, y_sales)
 
 # ==========================================
-# 2. Logic Functions
+# 2. Advanced Logic Functions
 # ==========================================
+def calculate_distance(lat1, lon1, lat2, lon2):
+    # Haversine formula
+    R = 6371.0 
+    dLat = math.radians(lat2 - lat1)
+    dLon = math.radians(lon2 - lon1)
+    a = math.sin(dLat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dLon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+def extract_exif_gps(img):
+    try:
+        exif = img._getexif()
+        if not exif: return None
+        
+        gps_info = {}
+        for tag, value in exif.items():
+            decoded = PIL.ExifTags.TAGS.get(tag, tag)
+            if decoded == "GPSInfo":
+                for t in value:
+                    sub_decoded = PIL.ExifTags.GPSTAGS.get(t, t)
+                    gps_info[sub_decoded] = value[t]
+        
+        if "GPSLatitude" in gps_info and "GPSLongitude" in gps_info:
+            lat = float(gps_info["GPSLatitude"][0]) + float(gps_info["GPSLatitude"][1])/60 + float(gps_info["GPSLatitude"][2])/3600
+            if gps_info.get("GPSLatitudeRef") == "S": lat = -lat
+            
+            lon = float(gps_info["GPSLongitude"][0]) + float(gps_info["GPSLongitude"][1])/60 + float(gps_info["GPSLongitude"][2])/3600
+            if gps_info.get("GPSLongitudeRef") == "W": lon = -lon
+            
+            return lat, lon
+    except:
+        pass
+    return None
+
 def get_geo_signals(lat, lon, radius=500):
     overpass_url = "http://overpass-api.de/api/interpreter"
-    
-    overpass_query_comp = f"""
-    [out:json];
-    (
-      nwr["shop"="convenience"](around:{radius},{lat},{lon});
-      nwr["shop"="supermarket"](around:{radius},{lat},{lon});
-      nwr["shop"="kiosk"](around:{radius},{lat},{lon});
-      nwr["shop"="general"](around:{radius},{lat},{lon});
-      nwr["shop"="grocery"](around:{radius},{lat},{lon});
-    );
-    out count;
-    """
-    
-    overpass_query_footfall = f"""
-    [out:json];
-    (
-      nwr["amenity"="school"](around:{radius},{lat},{lon});
-      nwr["amenity"="hospital"](around:{radius},{lat},{lon});
-      nwr["landuse"="residential"](around:{radius},{lat},{lon});
-      nwr["building"="apartments"](around:{radius},{lat},{lon});
-      nwr["office"](around:{radius},{lat},{lon});
-    );
-    out count;
-    """
-    
+    overpass_query_comp = f'[out:json];(nwr["shop"="convenience"](around:{radius},{lat},{lon});nwr["shop"="supermarket"](around:{radius},{lat},{lon});nwr["shop"="kiosk"](around:{radius},{lat},{lon});nwr["shop"="general"](around:{radius},{lat},{lon});nwr["shop"="grocery"](around:{radius},{lat},{lon}););out count;'
+    overpass_query_footfall = f'[out:json];(nwr["amenity"="school"](around:{radius},{lat},{lon});nwr["amenity"="hospital"](around:{radius},{lat},{lon});nwr["landuse"="residential"](around:{radius},{lat},{lon});nwr["building"="apartments"](around:{radius},{lat},{lon});nwr["office"](around:{radius},{lat},{lon}););out count;'
     headers = {'User-Agent': 'TenZorX_Underwriting_Engine_v1'}
     competitors = 3
     footfall_index = 5
     
     try:
         res_comp = requests.get(overpass_url, params={'data': overpass_query_comp}, headers=headers, timeout=5)
-        if res_comp.status_code == 200:
-            competitors = int(res_comp.json()['elements'][0]['tags']['total'])
+        if res_comp.status_code == 200: competitors = int(res_comp.json()['elements'][0]['tags']['total'])
             
         res_foot = requests.get(overpass_url, params={'data': overpass_query_footfall}, headers=headers, timeout=5)
         if res_foot.status_code == 200:
             raw_footfall = int(res_foot.json()['elements'][0]['tags']['total'])
             footfall_index = min(10, max(1, int(raw_footfall / 2)))
-    except Exception as e:
-        print(f"Error fetching geo signals: {e}")
-        
+    except: pass
     return competitors, footfall_index
 
 def calculate_shelf_density(boxes, img_width, img_height):
-    if len(boxes) == 0: return 0.0
+    if len(boxes) == 0: return 0.0, 10.0
     
-    # Create a mask to calculate union of all bounding boxes to avoid double counting overlaps
     mask = np.zeros((img_height, img_width), dtype=np.uint8)
-    
-    # Track the outermost boundaries to estimate the "Active Shelf Area"
     min_x, min_y = img_width, img_height
     max_x, max_y = 0, 0
+    sum_individual_areas = 0
     
     for box in boxes.xyxy:
         x1, y1, x2, y2 = map(int, box[:4])
         mask[y1:y2, x1:x2] = 1
+        
+        box_area = max(1, x2 - x1) * max(1, y2 - y1)
+        sum_individual_areas += box_area
         
         if x1 < min_x: min_x = x1
         if y1 < min_y: min_y = y1
         if x2 > max_x: max_x = x2
         if y2 > max_y: max_y = y2
         
-    # Calculate the area of the shelf that actually contains products
     active_width = max(1, max_x - min_x)
     active_height = max(1, max_y - min_y)
     active_shelf_area = active_width * active_height
     
-    # Density is the product area divided by the active shelf area, NOT the entire image
-    # (which includes irrelevant floors and ceilings)
-    product_area = np.sum(mask)
-    density = product_area / active_shelf_area
+    union_area = np.sum(mask)
+    density = union_area / active_shelf_area
     
-    return round(min(1.0, float(density)), 2)
+    # Store Organization Proxy: If union area == sum of areas, there is NO overlap (perfectly organized).
+    org_ratio = union_area / max(1, sum_individual_areas)
+    organization_score = min(10.0, max(1.0, round(org_ratio * 10, 1)))
+    
+    return round(min(1.0, float(density)), 2), organization_score
 
-def process_images(image_bytes_list):
+def process_images(image_bytes_list, form_lat, form_lon):
     total_skus = 0
     total_density = 0.0
+    total_org = 0.0
+    densities = []
+    brightness_scores = []
     unique_classes = set()
     num_images = len(image_bytes_list)
+    is_gps_spoofed = False
     
-    if num_images == 0:
-        return 0, 0.0, 0, 0
+    if num_images == 0: return 0, 0.0, 0, 0, False, False, False, 5.0
     
     for img_bytes in image_bytes_list:
-        # Load image
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        
+        img_gps = extract_exif_gps(img)
+        if img_gps and form_lat and form_lon:
+            try:
+                dist = calculate_distance(float(form_lat), float(form_lon), img_gps[0], img_gps[1])
+                if dist > 0.5: is_gps_spoofed = True # Over 500 meters mismatch!
+            except: pass
+            
         img_np = np.array(img)
         img_height, img_width = img_np.shape[:2]
+        brightness_scores.append(np.mean(img_np))
         
-        # Run YOLO
         results = yolo_model(img_np, imgsz=1024, conf=0.15, iou=0.45)
         boxes = results[0].boxes
         
-        # Extract unique classes for Diversity Score
         if boxes.cls is not None:
             unique_classes.update(boxes.cls.cpu().numpy().tolist())
             
-        # Apply an expansion multiplier to account for non-standard retail packaging
-        # not captured by the base object detection weights.
         sku_count = len(boxes) * 15
-        density = calculate_shelf_density(boxes, img_width, img_height)
+        density, org_score = calculate_shelf_density(boxes, img_width, img_height)
         
+        densities.append(density)
         total_skus += sku_count
         total_density += density
+        total_org += org_score
         
-    # Summing the SKU counts across multiple shelf photos to estimate total store inventory.
     avg_sku = total_skus
     avg_density = round(total_density / num_images, 2)
+    avg_org_score = round(total_org / num_images, 1)
     
     sku_diversity_score = min(10, len(unique_classes))
-    inventory_value_estimate = avg_sku * 40 # Approx Rs 40 average per FMCG item
+    inventory_value_estimate = avg_sku * 40 
     
-    return avg_sku, avg_density, sku_diversity_score, inventory_value_estimate
+    density_variance = np.var(densities) if len(densities) > 1 else 0.0
+    is_biased_photography = bool(density_variance > 0.15) 
+    
+    is_low_light = False
+    if len(brightness_scores) > 0 and np.mean(brightness_scores) < 60:
+        is_low_light = True
+    
+    return avg_sku, avg_density, sku_diversity_score, inventory_value_estimate, is_biased_photography, is_low_light, is_gps_spoofed, avg_org_score
 
 def evaluate_loan(images_bytes, lat, lon, shop_size_sqft=150):
-    avg_sku, avg_density, sku_diversity, inventory_value = process_images(images_bytes)
+    avg_sku, avg_density, sku_diversity, inventory_value, is_biased_photo, is_low_light, is_gps_spoofed, org_score = process_images(images_bytes, lat, lon)
     competitors, footfall_index = get_geo_signals(lat, lon)
     
     current_store = pd.DataFrame({
@@ -165,7 +191,6 @@ def evaluate_loan(images_bytes, lat, lon, shop_size_sqft=150):
     daily_lower = int(model_lower.predict(current_store)[0])
     daily_upper = int(model_upper.predict(current_store)[0])
     
-    # Enforce logical bounds on predictions
     if daily_lower < 0: daily_lower = 0
     if daily_upper < daily_lower: daily_upper = daily_lower + 1000
     
@@ -179,28 +204,35 @@ def evaluate_loan(images_bytes, lat, lon, shop_size_sqft=150):
     spread_ratio = (daily_upper - daily_lower) / daily_upper if daily_upper > 0 else 0
     confidence_score = round(max(0.0, 1.0 - spread_ratio), 2)
     
-    # ---------------------------------------------------------
-    # Fraud & Adversarial Logic Validation
-    # ---------------------------------------------------------
-    risk_flags = []
+    max_affordable_emi = int(monthly_inc_lower * 0.30)
+    pre_approved_loan_amount = max_affordable_emi * 20
     
-    if inventory_value > 100000 and footfall_index < 3:
-        risk_flags.append("inventory_footfall_mismatch")
+    market_percentile = "Top 50%"
+    if monthly_rev_upper > 600000 and footfall_index >= 5: market_percentile = "Top 15%"
+    elif monthly_rev_upper > 900000: market_percentile = "Top 5%"
+    elif monthly_rev_upper < 150000: market_percentile = "Bottom 25%"
+    
+    risk_flags = []
+    if inventory_value > 100000 and footfall_index < 3: risk_flags.append("inventory_footfall_mismatch")
+    if avg_density > 0.95: risk_flags.append("overstocked_possible_inspection_gaming")
+    elif 0.60 <= avg_density <= 0.85: risk_flags.append("healthy_turnover_refill_signal")
+    if shop_size_sqft > 300 and sku_diversity < 3: risk_flags.append("diversity_size_mismatch")
+    if is_biased_photo: risk_flags.append("inconsistent_stock_distribution_possible_biased_photography")
+    if is_low_light: risk_flags.append("low_light_conditions_detected_proceed_with_caution")
+    if is_gps_spoofed: risk_flags.append("CRITICAL: geolocation_spoofing_detected_exif_mismatch")
         
-    if avg_density > 0.95:
-        risk_flags.append("overstocked_possible_inspection_gaming")
-    elif 0.60 <= avg_density <= 0.85:
-        risk_flags.append("healthy_turnover_refill_signal")
-        
-    if shop_size_sqft > 300 and sku_diversity < 3:
-        risk_flags.append("diversity_size_mismatch")
-        
-    # Penalize confidence if there are negative risk flags
     penalty = 0.0
     for flag in risk_flags:
-        if "mismatch" in flag or "gaming" in flag:
-            penalty += 0.15
+        if "mismatch" in flag or "gaming" in flag or "biased" in flag or "CRITICAL" in flag:
+            penalty += 0.20
     confidence_score = round(max(0.1, confidence_score - penalty), 2)
+    
+    memo = f"Store evaluated in the {market_percentile} for its catchment area (Footfall Index: {footfall_index}/10). "
+    memo += f"Visual management quality is {'excellent' if org_score >= 8 else 'moderate' if org_score >= 5 else 'poor'} with an Organization Score of {org_score}/10. "
+    if len(risk_flags) == 0:
+        memo += "No risk flags detected. Recommended for immediate maximum capital disbursement."
+    else:
+        memo += f"However, {len(risk_flags)} risk flags were triggered, including: '{risk_flags[0].replace('_', ' ')}'. Manual review recommended."
     
     return {
         "daily_sales_range": [daily_lower, daily_upper],
@@ -209,11 +241,18 @@ def evaluate_loan(images_bytes, lat, lon, shop_size_sqft=150):
         "confidence_score": confidence_score,
         "risk_flags": risk_flags if risk_flags else ["none_detected"],
         "recommendation": "approve_tier_1" if confidence_score > 0.75 else "approve_tier_2" if confidence_score > 0.5 else "needs_verification",
+        "loan_details": {
+            "max_affordable_emi_inr": max_affordable_emi,
+            "pre_approved_loan_amount_inr": pre_approved_loan_amount,
+            "market_percentile": market_percentile,
+            "underwriter_memo": memo
+        },
         "latent_variables": {
             "inventory_value_estimate_inr": inventory_value,
             "footfall_proxy_index": footfall_index,
             "sku_diversity_score": sku_diversity,
-            "shelf_density_index": avg_density
+            "shelf_density_index": avg_density,
+            "organization_score": org_score
         },
         "extracted_features": {
             "avg_sku": avg_sku,
