@@ -40,7 +40,36 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     dLon = math.radians(lon2 - lon1)
     a = math.sin(dLat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dLon / 2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+    return R * c * 1000  # Return in meters
+
+def validate_image_locations(image_capture_lats, image_capture_lons, submitted_lat, submitted_lon, max_distance_threshold=50):
+    """
+    Validate that all captured images are from the same location
+    Returns: (is_valid, location_variance_meters, flag_message)
+    """
+    if not image_capture_lats or not image_capture_lons:
+        # No capture location metadata, validation skipped
+        return True, 0, ""
+    
+    max_distance = 0
+    location_mismatches = []
+    
+    # Check each image against submitted location
+    for idx, (lat, lon) in enumerate(zip(image_capture_lats, image_capture_lons)):
+        if lat == 0 and lon == 0:
+            continue  # Skip if no GPS data
+        
+        distance = calculate_distance(submitted_lat, submitted_lon, lat, lon)
+        max_distance = max(max_distance, distance)
+        
+        if distance > max_distance_threshold:
+            location_mismatches.append((idx, distance))
+    
+    if location_mismatches:
+        flag_msg = f"Location variance detected: Image(s) {[x[0] for x in location_mismatches]} taken {max(x[1] for x in location_mismatches):.0f}m away from submitted location."
+        return False, max_distance, flag_msg
+    
+    return True, max_distance, ""
 
 def extract_exif_gps(img):
     try:
@@ -175,9 +204,24 @@ def process_images(image_bytes_list, form_lat, form_lon):
     
     return avg_sku, avg_density, sku_diversity_score, inventory_value_estimate, is_biased_photography, is_low_light, is_gps_spoofed, avg_org_score
 
-def evaluate_loan(images_bytes, lat, lon, shop_size_sqft=150):
+def evaluate_loan(images_bytes, lat, lon, shop_size_sqft=150, image_lats=None, image_lons=None, email=None):
     avg_sku, avg_density, sku_diversity, inventory_value, is_biased_photo, is_low_light, is_gps_spoofed, org_score = process_images(images_bytes, lat, lon)
     competitors, footfall_index = get_geo_signals(lat, lon)
+    
+    # Validate image capture locations
+    location_fraud_flag = False
+    location_variance_distance = 0
+    if image_lats and image_lons:
+        # Estimate shop radius in meters (1 sqft = ~0.0929 sqm, Area = pi * r^2)
+        estimated_area_sqm = shop_size_sqft * 0.092903
+        estimated_radius_m = math.sqrt(estimated_area_sqm / math.pi)
+        # We allow the estimated radius + 15m buffer for standard GPS variance
+        dynamic_threshold = estimated_radius_m + 15.0
+        
+        is_valid, variance_meters, flag_msg = validate_image_locations(image_lats, image_lons, lat, lon, max_distance_threshold=dynamic_threshold)
+        if not is_valid:
+            location_fraud_flag = True
+            location_variance_distance = variance_meters
     
     current_store = pd.DataFrame({
         'sku_count': [avg_sku],
@@ -205,7 +249,18 @@ def evaluate_loan(images_bytes, lat, lon, shop_size_sqft=150):
     confidence_score = round(max(0.0, 1.0 - spread_ratio), 2)
     
     max_affordable_emi = int(monthly_inc_lower * 0.30)
-    pre_approved_loan_amount = max_affordable_emi * 20
+    total_pre_approved_loan_amount = max_affordable_emi * 20
+    
+    # Staged disbursement logic to avoid single-day stock stuffing fraud
+    initial_sanction_amount = int(total_pre_approved_loan_amount * 0.20) # 20% upfront (approx 2 months runway)
+    final_sanction_amount = total_pre_approved_loan_amount - initial_sanction_amount # 80% remaining unlocked after 6 months
+
+    monitoring_schedule = {
+        "description": "Continuous Monitoring to prevent inventory stuffing fraud.",
+        "email_target": email if email else "not_provided@example.com",
+        "starting_week": "3 random days of the week, 3 times a day.",
+        "months_1_to_6": "Random days in 5-6 months, continuous 3 times a day alerts."
+    }
     
     market_percentile = "Top 50%"
     if monthly_rev_upper > 600000 and footfall_index >= 5: market_percentile = "Top 15%"
@@ -220,6 +275,7 @@ def evaluate_loan(images_bytes, lat, lon, shop_size_sqft=150):
     if is_biased_photo: risk_flags.append("inconsistent_stock_distribution_possible_biased_photography")
     if is_low_light: risk_flags.append("low_light_conditions_detected_proceed_with_caution")
     if is_gps_spoofed: risk_flags.append("CRITICAL: geolocation_spoofing_detected_exif_mismatch")
+    if location_fraud_flag: risk_flags.append(f"CRITICAL: images_taken_from_different_locations_max_variance_{location_variance_distance:.0f}m")
         
     penalty = 0.0
     for flag in risk_flags:
@@ -243,9 +299,12 @@ def evaluate_loan(images_bytes, lat, lon, shop_size_sqft=150):
         "recommendation": "approve_tier_1" if confidence_score > 0.75 else "approve_tier_2" if confidence_score > 0.5 else "needs_verification",
         "loan_details": {
             "max_affordable_emi_inr": max_affordable_emi,
-            "pre_approved_loan_amount_inr": pre_approved_loan_amount,
+            "pre_approved_loan_amount_inr": total_pre_approved_loan_amount,
+            "initial_sanction_amount_inr": initial_sanction_amount,
+            "final_sanction_amount_inr": final_sanction_amount,
             "market_percentile": market_percentile,
-            "underwriter_memo": memo
+            "underwriter_memo": memo,
+            "monitoring_schedule": monitoring_schedule
         },
         "latent_variables": {
             "inventory_value_estimate_inr": inventory_value,
